@@ -1,0 +1,9 @@
+{
+  "search.exclude": {
+    "out": true,
+  },
+  "typescript.tsc.autoDetect": "off",
+  "typescript.format.enable": true,
+  "editor.formatOnSave": true,
+  "editor.rulers": [80],
+}

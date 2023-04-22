@@ -1,0 +1,59 @@
+{
+  "name": "tree-sitter-api",
+  "displayName": "Tree Sitter API",
+  "description": "The Tree Sitter API made available to other extensions",
+  "publisher": "gregoire",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.77.0"
+  },
+  "license": "MPL-2.0",
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "yarn run compile",
+    "compile": "yarn run esbuild-base --define:DEV=false --minify",
+    "compile:dts": "tsc --project . --declaration --emitDeclarationOnly",
+    "compile:wasm": "node build-wasm.mjs",
+    "esbuild-base": "esbuild src/extension.ts --bundle --loader:.wasm=file --platform=node --target=node16 --external:vscode --outdir=out",
+    "watch": "yarn run esbuild-base --define:DEV=true --sourcemap --watch",
+    "watch:test": "glob src/test/**/*.ts \"--cmd=esbuild --platform=node --format=cjs --target=node16 --outdir=out/test --sourcemap --watch\"",
+    "pretest": "yarn run compile && yarn run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "16.x",
+    "@types/vscode": "^1.77.0",
+    "@typescript-eslint/eslint-plugin": "^5.56.0",
+    "@typescript-eslint/parser": "^5.56.0",
+    "@vscode/test-electron": "^2.3.0",
+    "esbuild": "^0.17.14",
+    "eslint": "^8.36.0",
+    "glob": "^10.2.1",
+    "mocha": "^10.2.0",
+    "tree-sitter-c": "^0.20.2",
+    "tree-sitter-cli": "^0.20.8",
+    "tree-sitter-cpp": "^0.20.0",
+    "tree-sitter-go": "^0.19.1",
+    "tree-sitter-html": "^0.19.0",
+    "tree-sitter-javascript": "^0.19.0",
+    "tree-sitter-python": "^0.20.1",
+    "tree-sitter-rust": "^0.20.3",
+    "tree-sitter-typescript": "^0.20.1",
+    "typescript": "^4.9.5",
+    "web-tree-sitter": "^0.20.8"
+  }
+}
