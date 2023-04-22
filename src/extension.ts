@@ -1,9 +1,7 @@
 import * as vscode from "vscode";
-import TreeSitter from "web-tree-sitter";
+import TreeSitter, { Query, SyntaxNode, Tree } from "web-tree-sitter";
 
-import { SyntaxNode } from "web-tree-sitter";
-
-export { type SyntaxNode, TreeSitter };
+export { Query, type SyntaxNode, type Tree, TreeSitter };
 
 import TreeSitterWasm from "web-tree-sitter/tree-sitter.wasm";
 
@@ -49,6 +47,8 @@ export type API = Omit<typeof import("./extension"), "activate" | "deactivate">;
 export function activate(
   context: vscode.ExtensionContext,
 ): API {
+  let inspectScopesSubscription: vscode.Disposable | undefined;
+
   extensionContext = context;
 
   context.subscriptions.push(
@@ -77,6 +77,119 @@ export function activate(
         documentCache.delete(e);
       }
     }),
+    vscode.commands.registerCommand("tree-sitter.inspect-scopes", () => {
+      if (inspectScopesSubscription !== undefined) {
+        inspectScopesSubscription.dispose();
+        inspectScopesSubscription = undefined;
+
+        return;
+      }
+
+      const item = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Right,
+      );
+      item.command = "tree-sitter.inspect-scopes";
+
+      const cache = new Cache();
+      let cts: vscode.CancellationTokenSource | undefined;
+
+      const updateItem = () => {
+        if (cts !== undefined) {
+          cts.dispose();
+        }
+
+        cts = new vscode.CancellationTokenSource();
+        const token = cts.token;
+
+        (async (): Promise<
+          undefined | string | [text: string, tooltip: string]
+        > => {
+          const editor = vscode.window.activeTextEditor;
+
+          if (editor === undefined) {
+            return;
+          }
+
+          const document = editor.document;
+
+          try {
+            return await withDocumentTree(document, { cache }, (tree) => {
+              if (token.isCancellationRequested) {
+                return;
+              }
+
+              const activePosition = editor.selection.active;
+              const closestNode = tree.rootNode.descendantForPosition(
+                fromPosition(activePosition),
+              );
+              const scopes: string[] = [];
+
+              for (
+                let node: SyntaxNode | null = closestNode;
+                node !== null;
+                node = node.parent
+              ) {
+                scopes.push(node.type);
+              }
+
+              return [scopes[0], scopes.reverse().join("\n")];
+            });
+          } catch (e) {
+            return ["<cannot load tree>", `${e}`];
+          }
+        })().then((texts) => {
+          if (texts === undefined) {
+            item.hide();
+
+            return;
+          }
+
+          const [text, tooltip] = Array.isArray(texts)
+            ? texts
+            : [texts, undefined];
+
+          item.text = `$(list-filter) ${text}`;
+          item.tooltip = tooltip === undefined
+            ? undefined
+            : new vscode.MarkdownString(
+              "Tree Sitter scopes\n\n" +
+                "-----\n\n" +
+                tooltip.replace(/\n/g, "  \n"),
+            );
+
+          item.show();
+        });
+      };
+
+      const subscriptions = [
+        vscode.window.onDidChangeActiveTextEditor(() => updateItem()),
+        vscode.window.onDidChangeTextEditorSelection(() => updateItem()),
+        vscode.workspace.onDidChangeTextDocument((e) => {
+          if (vscode.window.activeTextEditor?.document === e.document) {
+            updateItem();
+          }
+        }),
+      ];
+
+      inspectScopesSubscription = {
+        dispose() {
+          item.dispose();
+
+          for (const subscription of subscriptions) {
+            subscription.dispose();
+          }
+        },
+      };
+
+      updateItem();
+    }),
+    // Dynamic subscriptions.
+    {
+      dispose() {
+        inspectScopesSubscription?.dispose();
+        inspectScopesSubscription = undefined;
+      },
+    },
   );
 
   // Public API:
@@ -87,12 +200,20 @@ export function activate(
     documentTree,
     documentTreeSync,
     ensureLoaded,
+    fromPosition,
+    fromRange,
     Language,
-    positionOf,
     query,
+    Query,
     querySync,
-    rangeOf,
+    toPosition,
+    toRange,
     TreeSitter,
+    using,
+    withDocumentTree,
+    withDocumentTreeSync,
+    withQuery,
+    withQuerySync,
   });
 }
 
@@ -101,8 +222,8 @@ export function activate(
  */
 export function deactivate(): void {
   // Clear cache.
-  for (const key in languages) {
-    delete languages[key as Language];
+  for (const key in loadedLanguages) {
+    delete loadedLanguages[key as Language];
   }
 
   for (const { tree } of documentCache.values()) {
@@ -135,10 +256,6 @@ export enum Language {
 
 const allLanguages: readonly Language[] = Object.values(Language);
 
-const languages: {
-  [language in Language]?: TreeSitter.Language | Promise<TreeSitter.Language>;
-} = {};
-
 /**
  * Mapping from {@link Language} to the `.wasm` file that must be loaded for it.
  */
@@ -153,6 +270,29 @@ const languageWasmMap = Object.freeze({
   [Language.TypeScript]: TreeSitterTypescript,
   [Language.TypeScriptReact]: TreeSitterTsx,
 });
+
+/**
+ * Mapping from VS Code language ID to its corresponding {@link Language}.
+ */
+const knownLanguageIds: { [languageId: string]: Language } = Object.freeze({
+  "c": Language.C,
+  "cpp": Language.Cpp,
+  "go": Language.Go,
+  "html": Language.Html,
+  "javascript": Language.JavaScript,
+  "javascriptreact": Language.JavaScriptReact,
+  "python": Language.Python,
+  "rust": Language.Rust,
+  "typescript": Language.TypeScript,
+  "typescriptreact": Language.TypeScriptReact,
+});
+
+/**
+ * Cache of loaded languages.
+ */
+const loadedLanguages: {
+  [language in Language]?: TreeSitter.Language | Promise<TreeSitter.Language>;
+} = {};
 
 /**
  * Ensures that Tree Sitter is loaded.
@@ -184,9 +324,9 @@ export async function ensureLoaded(
 
   const validLanguage = determineLanguageOrFail(language);
 
-  await (languages[validLanguage] ??= TreeSitter.Language.load(
+  await (loadedLanguages[validLanguage] ??= TreeSitter.Language.load(
     resolveWasmFilePath(languageWasmMap[validLanguage]),
-  ).then((l) => languages[validLanguage] = l));
+  ).then((l) => loadedLanguages[validLanguage] = l));
 }
 
 /**
@@ -197,19 +337,6 @@ export type HasLanguage =
   | string
   | vscode.Uri
   | vscode.TextDocument;
-
-const knownLanguageIds: { [languageId: string]: Language } = Object.freeze({
-  "c": Language.C,
-  "cpp": Language.Cpp,
-  "go": Language.Go,
-  "html": Language.Html,
-  "javascript": Language.JavaScript,
-  "javascriptreact": Language.JavaScriptReact,
-  "python": Language.Python,
-  "rust": Language.Rust,
-  "typescript": Language.TypeScript,
-  "typescriptreact": Language.TypeScriptReact,
-});
 
 /**
  * Returns the {@link Language} of the file at the given value if it can be
@@ -305,11 +432,6 @@ export class Cache {
   public constructor() {
     Object.freeze(this);
   }
-
-  /**
-   * Clears all entries in the cache.
-   */
-  public clear(): void {}
 }
 
 /**
@@ -330,62 +452,17 @@ export interface DocumentTreeOptions {
 }
 
 /**
- * The object returned by {@link documentTree()} and {@link documentTreeSync()}.
- *
- * This tree does not need to be manually deleted.
- */
-export interface DocumentTree {
-  /**
-   * The input {@link vscode.TextDocument TextDocument}.
-   */
-  readonly document: vscode.TextDocument;
-  /**
-   * The {@link Language} of the document.
-   */
-  readonly language: Language;
-  /**
-   * The {@link TreeSitter.SyntaxNode root node} of the document.
-   */
-  readonly rootNode: TreeSitter.SyntaxNode;
-
-  /**
-   * Returns a copy of the tree.
-   */
-  copy(): DocumentTree;
-
-  /**
-   * Performs the given edit on the tree, returning a new one.
-   */
-  edit(delta: TreeSitter.Edit): DocumentTree;
-
-  /**
-   * Returns a cursor over the tree. Note that the cursor must be disposed
-   * manually using `delete()`.
-   */
-  walk(): TreeSitter.TreeCursor;
-
-  getChangedRanges(other: DocumentTree): vscode.Range[];
-  getEditedRange(other: DocumentTree): vscode.Range;
-}
-
-/**
  * Returns the document tree for the specified document,
  * {@link ensureLoaded loading} the necessary code first if necessary.
  */
 export async function documentTree(
   document: vscode.TextDocument,
   options: DocumentTreeOptions = {},
-): Promise<DocumentTree> {
+): Promise<Tree> {
   await ensureLoaded(document);
 
   return documentTreeSync(document, options);
 }
-
-const finalizationRegistry = new FinalizationRegistry<{ delete(): void }>((
-  tree,
-) => tree.delete());
-
-const underlyingTrees = new WeakMap<DocumentTree, TreeSitter.Tree>();
 
 /**
  * Returns the document tree for the specified document, failing if the
@@ -394,59 +471,35 @@ const underlyingTrees = new WeakMap<DocumentTree, TreeSitter.Tree>();
 export function documentTreeSync(
   document: vscode.TextDocument,
   options: DocumentTreeOptions = {},
-): DocumentTree {
+): Tree {
   // Initialize parser with the relevant language.
   const parser = new TreeSitter();
-  const languageToLoad = options.language ?? determineLanguageOrFail(document);
-  const language = getLanguageSync(languageToLoad);
-
-  if (!(language instanceof TreeSitter.Language)) {
-    throw new Error(`language "${language}" is not loaded`);
-  }
+  const language = getLanguageSync(
+    options.language ?? determineLanguageOrFail(document),
+  );
 
   parser.setLanguage(language);
 
   // Parse and return the tree.
-  let tree: TreeSitter.Tree;
-
   if (options.cache instanceof Cache) {
     const state = documentCache.get(document);
 
     if (state === undefined) {
-      tree = parser.parse(document.getText());
+      const tree = parser.parse(document.getText());
       documentCache.set(document, { tree: tree.copy(), dirtyTimestamp: 0 });
+      return tree;
     } else if (state.dirtyTimestamp !== 0) {
-      tree = parser.parse(document.getText(), state.tree);
+      const tree = parser.parse(document.getText(), state.tree);
       state.tree.delete();
       state.tree = tree.copy();
       state.dirtyTimestamp = 0;
+      return tree;
     } else {
-      tree = state.tree;
+      return state.tree.copy();
     }
   } else {
-    tree = parser.parse(document.getText());
+    return parser.parse(document.getText());
   }
-
-  return treeToDocumentTree(tree, document, languageToLoad);
-}
-
-/**
- * A compiled query.
- */
-export interface Query {
-  readonly captureNames: readonly string[];
-
-  matches(
-    node: SyntaxNode,
-    startPosition?: vscode.Position,
-    endPosition?: vscode.Position,
-  ): TreeSitter.QueryMatch[];
-  captures(
-    node: SyntaxNode,
-    startPosition?: vscode.Position,
-    endPosition?: vscode.Position,
-  ): TreeSitter.QueryCapture[];
-  predicatesForPattern(patternIndex: number): TreeSitter.PredicateResult[];
 }
 
 /**
@@ -488,29 +541,148 @@ export function querySync(language: HasLanguage, source?: string) {
       querySync(language, String.raw(strings, ...args));
   }
 
-  return queryToQuery(
-    getLanguageSync(determineLanguageOrFail(language)).query(source),
-  );
+  return getLanguageSync(determineLanguageOrFail(language)).query(source);
+}
+
+/**
+ * Executes the specified function with the result of {@link documentTree()},
+ * {@link Tree.delete() deleting} the tree after the end of the function.
+ */
+export const withDocumentTree = makeWith(documentTree) as {
+  <T>(
+    document: vscode.TextDocument,
+    k: (tree: Tree) => T | PromiseLike<T>,
+  ): Promise<T>;
+  <T>(
+    document: vscode.TextDocument,
+    options: DocumentTreeOptions | undefined,
+    k: (tree: Tree) => T | PromiseLike<T>,
+  ): Promise<T>;
+};
+
+/**
+ * Executes the specified function with the result of {@link documentTreeSync()},
+ * {@link Tree.delete() deleting} the tree after the end of the function.
+ */
+export const withDocumentTreeSync = makeSyncWith(documentTreeSync) as {
+  <T>(document: vscode.TextDocument, k: (tree: Tree) => T): T;
+  <T>(
+    document: vscode.TextDocument,
+    options: DocumentTreeOptions | undefined,
+    k: (tree: Tree) => T,
+  ): T;
+};
+
+/**
+ * Executes the specified function with the result of {@link query()},
+ * {@link Query.delete() deleting} the query after the end of the function.
+ */
+export const withQuery = makeWith(query) as {
+  <T>(
+    language: HasLanguage,
+    source: string,
+    k: (query: Query) => T | PromiseLike<T>,
+  ): Promise<T>;
+};
+
+/**
+ * Executes the specified function with the result of {@link querySync()},
+ * {@link Query.delete() deleting} the query after the end of the function.
+ */
+export const withQuerySync = makeSyncWith(querySync) as {
+  <T>(language: HasLanguage, source: string, k: (query: Query) => T): T;
+};
+
+/**
+ * Executes the specified function with the given arguments, calling
+ * `arg.delete()` for each `arg` in `args` after the end of its execution.
+ *
+ * The function may return a `Promise`, in which case a promise will be
+ * returned as well.
+ */
+export function using<T, Args extends { delete(): void }[]>(
+  ...args: [...Args, (...args: Args) => T]
+): T {
+  const f = args.pop() as (...args: Args) => T;
+  let result: T;
+
+  try {
+    result = f(...args as unknown as Args);
+  } catch (e) {
+    for (const arg of args as unknown as Args) {
+      arg.delete();
+    }
+
+    throw e;
+  }
+
+  if (
+    result == null ||
+    typeof (result as unknown as PromiseLike<unknown>)["then"] !== "function"
+  ) {
+    for (const arg of args as unknown as Args) {
+      arg.delete();
+    }
+
+    return result;
+  }
+
+  return (async () => {
+    try {
+      return await result;
+    } finally {
+      for (const arg of args as unknown as Args) {
+        arg.delete();
+      }
+    }
+  })() as T;
+}
+
+/**
+ * A Tree Sitter point with UTF-16-based offsets.
+ *
+ * @see {@link TreeSitter.Point}
+ */
+export type Point = TreeSitter.Point;
+
+/**
+ * Converts a Tree Sitter {@link Point} to a {@link vscode.Position}.
+ */
+export function toPosition(point: Point): vscode.Position {
+  return new vscode.Position(point.row, point.column);
+}
+
+/**
+ * Converts a {@link vscode.Position} into a Tree Sitter {@link Point}.
+ */
+export function fromPosition(position: vscode.Position): Point {
+  return { row: position.line, column: position.character };
 }
 
 /**
  * Returns the {@link vscode.Position} of a Tree Sitter syntax node.
  */
-export function rangeOf(node: SyntaxNode): vscode.Range {
-  const startPosition = positionOf(node.startPosition);
+export function toRange(node: SyntaxNode): vscode.Range {
+  const startPosition = toPosition(node.startPosition);
 
   if (node.startIndex === node.endIndex) {
     return new vscode.Range(startPosition, startPosition);
   }
 
-  return new vscode.Range(startPosition, positionOf(node.endPosition));
+  return new vscode.Range(startPosition, toPosition(node.endPosition));
 }
 
 /**
- * Converts a Tree Sitter point to a {@link vscode.Position}.
+ * Returns the start and end Tree Sitter {@link Point} positions of a
+ * {@link vscode.Range}.
  */
-export function positionOf(point: TreeSitter.Point): vscode.Position {
-  return new vscode.Position(point.row, point.column);
+export function fromRange(
+  range: vscode.Range,
+): { startPosition: Point; endPosition: Point } {
+  return {
+    startPosition: fromPosition(range.start),
+    endPosition: fromPosition(range.end),
+  };
 }
 
 function resolveWasmFilePath(path: string): string {
@@ -523,7 +695,7 @@ function resolveWasmFilePath(path: string): string {
 }
 
 function getLanguageSync(language: Language): TreeSitter.Language {
-  const loadedLanguage = languages[language];
+  const loadedLanguage = loadedLanguages[language];
 
   if (!(loadedLanguage instanceof TreeSitter.Language)) {
     throw new Error(`language "${language}" is not loaded`);
@@ -532,108 +704,32 @@ function getLanguageSync(language: Language): TreeSitter.Language {
   return loadedLanguage;
 }
 
-function queryToQuery(
-  query: TreeSitter.Query,
-): Query {
-  const result = Object.freeze<Query>({
-    captureNames: Object.freeze(query.captureNames),
+function makeWith<Args extends any[], R extends { delete(): void }>(
+  f: (...args: Args) => Promise<R>,
+): <T>(...args: [...Args, (value: R) => T | PromiseLike<T>]) => Promise<T> {
+  return async function withDeleteObject(...args) {
+    const k = args.pop() as (value: R) => PromiseLike<any>;
+    const result = await f(...args as unknown as Args);
 
-    captures(node, startPosition, endPosition) {
-      const start: TreeSitter.Point | undefined = startPosition === undefined
-        ? undefined
-        : { row: startPosition.line, column: startPosition.character };
-      const end: TreeSitter.Point | undefined = endPosition === undefined
-        ? undefined
-        : { row: endPosition.line, column: endPosition.character };
-
-      return query.captures(node, start, end);
-    },
-    matches(node, startPosition, endPosition) {
-      const end: TreeSitter.Point | undefined = endPosition === undefined
-        ? undefined
-        : { row: endPosition.line, column: endPosition.character };
-      const start: TreeSitter.Point | undefined = startPosition === undefined
-        ? undefined
-        : { row: startPosition.line, column: startPosition.character };
-
-      return query.matches(node, start, end);
-    },
-    predicatesForPattern(patternIndex) {
-      return query.predicatesForPattern(patternIndex);
-    },
-  });
-
-  finalizationRegistry.register(result, query);
-
-  return result;
+    try {
+      return await k(result);
+    } finally {
+      result.delete();
+    }
+  };
 }
 
-function treeToDocumentTree(
-  tree: TreeSitter.Tree,
-  document: vscode.TextDocument,
-  language: Language,
-): DocumentTree {
-  const documentTree = Object.freeze<DocumentTree>({
-    document,
-    language,
+function makeSyncWith<Args extends any[], R extends { delete(): void }>(
+  f: (...args: Args) => R,
+): <T>(...args: [...Args, (value: R) => T]) => T {
+  return function withDeleteObject(...args) {
+    const k = args.pop() as (value: R) => any;
+    const result = f(...args as unknown as Args);
 
-    get rootNode() {
-      return tree.rootNode;
-    },
-
-    copy() {
-      return treeToDocumentTree(tree.copy(), document, language);
-    },
-    edit(delta) {
-      return treeToDocumentTree(tree.edit(delta), document, language);
-    },
-    walk() {
-      return tree.walk();
-    },
-
-    // Note: Tree Sitter already performs the UTF-8 byte-indices -> UTF-16
-    //   code-point-positions conversion internally, so we don't need any such
-    //   conversion here.
-
-    getChangedRanges(other) {
-      const otherTree = underlyingTrees.get(other)!;
-      const ranges = tree.getChangedRanges(otherTree);
-      const importedRanges: vscode.Range[] = [];
-
-      for (const range of ranges) {
-        importedRanges.push(importRange(range));
-      }
-
-      return importedRanges;
-    },
-    getEditedRange(other) {
-      const otherTree = underlyingTrees.get(other)!;
-      const range = tree.getEditedRange(otherTree);
-
-      return importRange(range);
-    },
-  });
-
-  finalizationRegistry.register(documentTree, tree);
-  underlyingTrees.set(documentTree, tree);
-
-  return documentTree;
-}
-
-function importRange(range: TreeSitter.Range): vscode.Range {
-  const startPosition = new vscode.Position(
-    range.startPosition.row,
-    range.startPosition.column,
-  );
-
-  if (range.startIndex === range.endIndex) {
-    return new vscode.Range(startPosition, startPosition);
-  }
-
-  const endPosition = new vscode.Position(
-    range.endPosition.row,
-    range.endPosition.column,
-  );
-
-  return new vscode.Range(startPosition, endPosition);
+    try {
+      return k(result);
+    } finally {
+      result.delete();
+    }
+  };
 }

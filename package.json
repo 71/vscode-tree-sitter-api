@@ -1,5 +1,5 @@
 {
-  "name": "tree-sitter-api",
+  "name": "tree-sitter",
   "displayName": "Tree Sitter API",
   "description": "The Tree Sitter API made available to other extensions",
   "publisher": "gregoire",
@@ -19,6 +19,15 @@
     "untrustedWorkspaces": {
       "supported": true
     }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "tree-sitter.inspect-scopes",
+        "title": "Inspect Scopes",
+        "category": "Tree Sitter"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "yarn run compile",
