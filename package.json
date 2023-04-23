@@ -7,6 +7,10 @@
   "engines": {
     "vscode": "^1.77.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/71/vscode-tree-sitter-api"
+  },
   "license": "MPL-2.0",
   "categories": [
     "Other"
@@ -25,14 +29,15 @@
       {
         "command": "tree-sitter.inspect-scopes",
         "title": "Inspect Scopes",
-        "category": "Tree Sitter"
+        "category": "Tree Sitter",
+        "enablement": "tree-sitter.activeEditorIsSupported"
       }
     ]
   },
   "scripts": {
     "vscode:prepublish": "yarn run compile",
     "compile": "yarn run esbuild-base --define:DEV=false --minify",
-    "compile:dts": "tsc --project . --declaration --emitDeclarationOnly",
+    "compile:dts": "tsc --project . --declaration --emitDeclarationOnly && node update-dts.mjs",
     "compile:wasm": "node build-wasm.mjs",
     "esbuild-base": "esbuild src/extension.ts --bundle --loader:.wasm=file --platform=node --target=node16 --external:vscode --outdir=out",
     "watch": "yarn run esbuild-base --define:DEV=true --sourcemap --watch",
@@ -49,6 +54,7 @@
     "@typescript-eslint/eslint-plugin": "^5.56.0",
     "@typescript-eslint/parser": "^5.56.0",
     "@vscode/test-electron": "^2.3.0",
+    "@vscode/vsce": "^2.19.0",
     "esbuild": "^0.17.14",
     "eslint": "^8.36.0",
     "glob": "^10.2.1",

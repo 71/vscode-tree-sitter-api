@@ -39,7 +39,7 @@ let extensionContext: vscode.ExtensionContext;
  * Publicly exported API available with
  * `vscode.extensions.getExtension(...).activate()`.
  */
-export type API = Omit<typeof import("./extension"), "activate" | "deactivate">;
+export type API = Omit<typeof import("./extension"), "activate">;
 
 /**
  * Activation function called by VS Code.
@@ -76,6 +76,16 @@ export function activate(
         state.tree.delete();
         documentCache.delete(e);
       }
+    }),
+    vscode.window.onDidChangeActiveTextEditor((e) => {
+      const isActiveEditorSupported = e !== undefined &&
+        determineLanguage(e.document) !== undefined;
+
+      vscode.commands.executeCommand(
+        "setContext",
+        "tree-sitter.activeEditorIsSupported",
+        isActiveEditorSupported,
+      );
     }),
     vscode.commands.registerCommand("tree-sitter.inspect-scopes", () => {
       if (inspectScopesSubscription !== undefined) {
@@ -183,11 +193,25 @@ export function activate(
 
       updateItem();
     }),
-    // Dynamic subscriptions.
     {
       dispose() {
+        // Dynamic subscriptions.
         inspectScopesSubscription?.dispose();
         inspectScopesSubscription = undefined;
+
+        // Clear cache.
+        for (const key in loadedLanguages) {
+          delete loadedLanguages[key as Language];
+        }
+
+        for (const { tree } of documentCache.values()) {
+          tree.delete();
+        }
+
+        documentCache.clear();
+
+        // Unfortunately, we can't dispose of the cache maintained within
+        // Tree Sitter itself.
       },
     },
   );
@@ -215,27 +239,6 @@ export function activate(
     withQuery,
     withQuerySync,
   });
-}
-
-/**
- * De-activation function called by VS Code.
- */
-export function deactivate(): void {
-  // Clear cache.
-  for (const key in loadedLanguages) {
-    delete loadedLanguages[key as Language];
-  }
-
-  for (const { tree } of documentCache.values()) {
-    tree.delete();
-  }
-
-  documentCache.clear();
-
-  // Subscriptions will take care of event handlers registered above.
-  //
-  // Unfortunately, we can't dispose of the cache maintained within tree-sitter
-  // itself.
 }
 
 /**
@@ -307,16 +310,30 @@ export async function ensureLoaded(input: HasLanguage): Promise<void>;
 export async function ensureLoaded(
   language?: HasLanguage,
 ): Promise<void> {
-  await TreeSitter.init({
-    locateFile(path: string, prefix: string): string {
-      if (path === "tree-sitter.wasm") {
-        return resolveWasmFilePath(TreeSitterWasm);
-      }
+  if (TreeSitter.Language === undefined) {
+    const wasmModule = await WebAssembly.compile(
+      await vscode.workspace.fs.readFile(
+        resolveWasmFilePath(TreeSitterWasm),
+      ),
+    );
 
-      // Fallback to default strategy.
-      return prefix + path;
-    },
-  });
+    await TreeSitter.init({
+      instantiateWasm(
+        imports: WebAssembly.Imports,
+        successCallback: (
+          instance: WebAssembly.Instance,
+          module: WebAssembly.Module,
+        ) => void,
+      ) {
+        // https://emscripten.org/docs/api_reference/module.html#Module.instantiateWasm
+        WebAssembly.instantiate(wasmModule, imports).then((instance) => {
+          successCallback(instance, wasmModule);
+        });
+
+        return {};
+      },
+    });
+  }
 
   if (language === undefined) {
     return;
@@ -324,9 +341,18 @@ export async function ensureLoaded(
 
   const validLanguage = determineLanguageOrFail(language);
 
-  await (loadedLanguages[validLanguage] ??= TreeSitter.Language.load(
-    resolveWasmFilePath(languageWasmMap[validLanguage]),
-  ).then((l) => loadedLanguages[validLanguage] = l));
+  if (loadedLanguages[validLanguage] === undefined) {
+    const wasmFileBytes = await vscode.workspace.fs.readFile(
+      resolveWasmFilePath(languageWasmMap[validLanguage]),
+    );
+    const languagePromise = TreeSitter.Language.load(
+      wasmFileBytes,
+    ).then((l) => loadedLanguages[validLanguage] = l);
+
+    loadedLanguages[validLanguage] = languagePromise;
+  }
+
+  await loadedLanguages[validLanguage];
 }
 
 /**
@@ -449,6 +475,11 @@ export interface DocumentTreeOptions {
    * used.
    */
   readonly cache?: Cache;
+
+  /**
+   * The timeout in milliseconds of the operation.
+   */
+  readonly timeoutMs?: number;
 }
 
 /**
@@ -459,7 +490,22 @@ export async function documentTree(
   document: vscode.TextDocument,
   options: DocumentTreeOptions = {},
 ): Promise<Tree> {
+  const deadline =
+    typeof options.timeoutMs === "number" && options.timeoutMs > 0
+      ? Date.now() + options.timeoutMs
+      : undefined;
+
   await ensureLoaded(document);
+
+  if (deadline !== undefined) {
+    const now = Date.now();
+
+    if (now >= deadline) {
+      throw new Error("timeout");
+    }
+
+    options = { ...options, timeoutMs: now - deadline };
+  }
 
   return documentTreeSync(document, options);
 }
@@ -473,32 +519,40 @@ export function documentTreeSync(
   options: DocumentTreeOptions = {},
 ): Tree {
   // Initialize parser with the relevant language.
-  const parser = new TreeSitter();
   const language = getLanguageSync(
     options.language ?? determineLanguageOrFail(document),
   );
+  const parser = new TreeSitter();
 
-  parser.setLanguage(language);
+  try {
+    parser.setLanguage(language);
 
-  // Parse and return the tree.
-  if (options.cache instanceof Cache) {
-    const state = documentCache.get(document);
-
-    if (state === undefined) {
-      const tree = parser.parse(document.getText());
-      documentCache.set(document, { tree: tree.copy(), dirtyTimestamp: 0 });
-      return tree;
-    } else if (state.dirtyTimestamp !== 0) {
-      const tree = parser.parse(document.getText(), state.tree);
-      state.tree.delete();
-      state.tree = tree.copy();
-      state.dirtyTimestamp = 0;
-      return tree;
-    } else {
-      return state.tree.copy();
+    if (typeof options.timeoutMs === "number" && options.timeoutMs > 0) {
+      parser.setTimeoutMicros(options.timeoutMs * 1e3);
     }
-  } else {
-    return parser.parse(document.getText());
+
+    // Parse and return the tree.
+    if (options.cache instanceof Cache) {
+      const state = documentCache.get(document);
+
+      if (state === undefined) {
+        const tree = parser.parse(document.getText());
+        documentCache.set(document, { tree: tree.copy(), dirtyTimestamp: 0 });
+        return tree;
+      } else if (state.dirtyTimestamp !== 0) {
+        const tree = parser.parse(document.getText(), state.tree);
+        state.tree.delete();
+        state.tree = tree.copy();
+        state.dirtyTimestamp = 0;
+        return tree;
+      } else {
+        return state.tree.copy();
+      }
+    } else {
+      return parser.parse(document.getText());
+    }
+  } finally {
+    parser.delete();
   }
 }
 
@@ -685,13 +739,8 @@ export function fromRange(
   };
 }
 
-function resolveWasmFilePath(path: string): string {
-  if (DEV) {
-    return vscode.Uri.joinPath(extensionContext.extensionUri, "out", path)
-      .fsPath;
-  } else {
-    return extensionContext.asAbsolutePath(path);
-  }
+function resolveWasmFilePath(path: string): vscode.Uri {
+  return vscode.Uri.joinPath(extensionContext.extensionUri, "out", path);
 }
 
 function getLanguageSync(language: Language): TreeSitter.Language {
