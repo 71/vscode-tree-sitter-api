@@ -12,14 +12,8 @@ It can:
 
 This is work-in-progress intended for future use within
 [Dance](https://github.com/71/dance). A few more polishing touches are needed
-before it will be ready to publish on the extension store.
-
-Among other things, the "raw" API of Tree Sitter is still leaked in a few places
-(e.g. with the `SyntaxNode` API), and it has only been tested in a dev
-environment (so prod environments should be tested, both in the browser and in
-VS Code directly).
-
-Most importantly, the API is very much subject to change.
+before it will be ready to publish on the extension store. More importantly, the
+API is very much subject to change.
 
 ## Usage
 
@@ -61,7 +55,11 @@ Note:
 1. Detection of the language of `document` was done automatically.
 2. The Tree Sitter library and Rust parser were both loaded implicitly when
    calling `documentTree()`.
-3. No object had to be manually deleted with `.delete()`.
+3. No object had to be manually deleted with `.delete()`, despite Tree Sitter
+   being a WebAssembly library which requires manual deallocation.
+   - It is still possible to manage your objects manually by using
+     `documentTree()` and `query()` (instead of their `with*` counterparts), but
+     you will have to make sure to call `.delete()` after using them.
 
 ## Scope inspection
 
