@@ -5,16 +5,6 @@ export { Query, type SyntaxNode, type Tree, TreeSitter };
 
 import TreeSitterWasm from "web-tree-sitter/tree-sitter.wasm";
 
-import TreeSitterC from "../data/tree-sitter-c.wasm";
-import TreeSitterCpp from "../data/tree-sitter-cpp.wasm";
-import TreeSitterGo from "../data/tree-sitter-go.wasm";
-import TreeSitterHtml from "../data/tree-sitter-html.wasm";
-import TreeSitterJavascript from "../data/tree-sitter-javascript.wasm";
-import TreeSitterPython from "../data/tree-sitter-python.wasm";
-import TreeSitterRust from "../data/tree-sitter-rust.wasm";
-import TreeSitterTypescript from "../data/tree-sitter-typescript.wasm";
-import TreeSitterTsx from "../data/tree-sitter-tsx.wasm";
-
 /**
  * The cache of parsed trees per document. Note that this cache is shared
  * between all `Cache`s. As of 2023-04-22, the API does not provide access to
@@ -32,6 +22,19 @@ const documentCache = new Map<vscode.TextDocument, {
    */
   dirtyTimestamp: number;
 }>();
+
+/**
+ * The cache of loaded `textobject` definitions per language.
+ *
+ * No entry means nothing is in the cache. A promise indicates that the value
+ * has been requested, but hasn't resolved yet. A `Query` indicates that the
+ * definitions were found and loaded, and `undefined` indicates that no
+ * definitions exist.
+ */
+const textObjectCache = new Map<
+  Language,
+  Promise<Query | undefined> | Query | undefined
+>();
 
 let extensionContext: vscode.ExtensionContext;
 
@@ -210,6 +213,16 @@ export function activate(
 
         documentCache.clear();
 
+        for (const query of textObjectCache.values()) {
+          if (query instanceof Promise) {
+            query.then((q) => q?.delete());
+          } else {
+            query?.delete();
+          }
+        }
+
+        textObjectCache.clear();
+
         // Unfortunately, we can't dispose of the cache maintained within
         // Tree Sitter itself.
       },
@@ -230,6 +243,7 @@ export function activate(
     query,
     Query,
     querySync,
+    textObjectQueryFor,
     toPosition,
     toRange,
     TreeSitter,
@@ -258,21 +272,6 @@ export enum Language {
 }
 
 const allLanguages: readonly Language[] = Object.values(Language);
-
-/**
- * Mapping from {@link Language} to the `.wasm` file that must be loaded for it.
- */
-const languageWasmMap = Object.freeze({
-  [Language.C]: TreeSitterC,
-  [Language.Cpp]: TreeSitterCpp,
-  [Language.Go]: TreeSitterGo,
-  [Language.Html]: TreeSitterHtml,
-  [Language.JavaScript]: TreeSitterJavascript,
-  [Language.Python]: TreeSitterPython,
-  [Language.Rust]: TreeSitterRust,
-  [Language.TypeScript]: TreeSitterTypescript,
-  [Language.TypeScriptReact]: TreeSitterTsx,
-});
 
 /**
  * Mapping from VS Code language ID to its corresponding {@link Language}.
@@ -313,7 +312,7 @@ export async function ensureLoaded(
   if (TreeSitter.Language === undefined) {
     const wasmModule = await WebAssembly.compile(
       await vscode.workspace.fs.readFile(
-        resolveWasmFilePath(TreeSitterWasm),
+        resolveAssetFilePath(TreeSitterWasm),
       ),
     );
 
@@ -343,7 +342,7 @@ export async function ensureLoaded(
 
   if (loadedLanguages[validLanguage] === undefined) {
     const wasmFileBytes = await vscode.workspace.fs.readFile(
-      resolveWasmFilePath(languageWasmMap[validLanguage]),
+      resolveAssetFilePath(`tree-sitter-[validLanguage].wasm`),
     );
     const languagePromise = TreeSitter.Language.load(
       wasmFileBytes,
@@ -564,12 +563,12 @@ export function documentTreeSync(
  */
 export function query(
   language: HasLanguage,
-): (strings: TemplateStringsArray, ...args: any) => Promise<Query>;
+): (strings: TemplateStringsArray, ...args: unknown[]) => Promise<Query>;
 export function query(language: HasLanguage, source: string): Promise<Query>;
 
 export function query(language: HasLanguage, source?: string) {
   if (source === undefined) {
-    return (strings: TemplateStringsArray, ...args: any[]) =>
+    return (strings: TemplateStringsArray, ...args: unknown[]) =>
       query(language, String.raw(strings, ...args));
   }
 
@@ -583,7 +582,7 @@ export function query(language: HasLanguage, source?: string) {
  */
 export function querySync(
   language: HasLanguage,
-): (strings: TemplateStringsArray, ...args: any) => Query;
+): (strings: TemplateStringsArray, ...args: unknown[]) => Query;
 export function querySync(
   language: HasLanguage,
   source: string,
@@ -591,7 +590,7 @@ export function querySync(
 
 export function querySync(language: HasLanguage, source?: string) {
   if (source === undefined) {
-    return (strings: TemplateStringsArray, ...args: any[]) =>
+    return (strings: TemplateStringsArray, ...args: unknown[]) =>
       querySync(language, String.raw(strings, ...args));
   }
 
@@ -693,6 +692,52 @@ export function using<T, Args extends { delete(): void }[]>(
 }
 
 /**
+ * Returns the built-in {@link Query} for textobjects of the given language, or
+ * `undefined` if there is no such built-in query.
+ *
+ * This function automatically memoizes its results; callers should neither
+ * cache nor {@link Query.delete delete} the returned query.
+ *
+ * @see https://docs.helix-editor.com/guides/textobject.html
+ */
+export async function textObjectQueryFor(
+  input: HasLanguage,
+): Promise<Omit<Query, "delete"> | undefined> {
+  const language = determineLanguageOrFail(input);
+
+  if (textObjectCache.has(language)) {
+    return await textObjectCache.get(language);
+  }
+
+  const promise = async function loadTextObjectQuery() {
+    let result: Query | undefined;
+
+    try {
+      const contents = await vscode.workspace.fs.readFile(
+        resolveAssetFilePath(`textobjects-${language}.scm`),
+      );
+
+      result = await query(language, new TextDecoder().decode(contents));
+    } catch {
+      // Ignore.
+    }
+
+    if (textObjectCache.size === 0) {
+      // Extension was disabled.
+      return;
+    }
+
+    textObjectCache.set(language, result);
+
+    return result;
+  }();
+
+  textObjectCache.set(language, promise);
+
+  return await promise;
+}
+
+/**
  * A Tree Sitter point with UTF-16-based offsets.
  *
  * @see {@link TreeSitter.Point}
@@ -739,7 +784,7 @@ export function fromRange(
   };
 }
 
-function resolveWasmFilePath(path: string): vscode.Uri {
+function resolveAssetFilePath(path: string): vscode.Uri {
   return vscode.Uri.joinPath(extensionContext.extensionUri, "out", path);
 }
 
