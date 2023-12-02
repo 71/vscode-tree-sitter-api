@@ -61,6 +61,39 @@ Note:
      `documentTree()` and `query()` (instead of their `with*` counterparts), but
      you will have to make sure to call `.delete()` after using them.
 
+## Development
+
+### Dependencies
+
+[Deno](https://deno.com) and [Emscripten](https://emscripten.org) must be
+installed with `deno` and `emcc` both available in the `PATH`.
+
+### Setup
+
+Install dependencies with `yarn`:
+
+```sh
+$ yarn
+```
+
+A few files must be generated for the build process to continue. Since building
+these files can be slow and requires internet access, this must be done
+manually:
+
+```sh
+$ ./tools.ts --build-wasm --update-text-objects
+```
+
+### Building
+
+Run `yarn run compile` to build the extension, and `yarn vsce package` to
+package it for publishing in the store.
+
+### Testing
+
+In VS Code, start the `watch:test` task, then launch "Extension Tests" in the
+"Run and Debug" menu.
+
 ## Scope inspection
 
 This extension provides a command named "Inspect Scopes" which displays the

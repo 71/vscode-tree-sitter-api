@@ -3,7 +3,7 @@
   "displayName": "Tree Sitter API",
   "description": "The Tree Sitter API made available to other extensions",
   "publisher": "gregoire",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "engines": {
     "vscode": "^1.77.0"
   },
@@ -35,16 +35,17 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "yarn run compile",
     "compile": "yarn run esbuild-base --define:DEV=false --minify",
-    "compile:dts": "tsc --project . --declaration --emitDeclarationOnly && node update-dts.mjs",
-    "compile:wasm": "node build-wasm.mjs",
+    "compile:dts": "tsc --project . --declaration --emitDeclarationOnly && ./tools.ts --update-dts",
+    "compile:wasm": "./tools.ts --build-wasm",
     "esbuild-base": "esbuild src/extension.ts --bundle --loader:.wasm=file --platform=node --target=node16 --external:vscode --outdir=out",
+    "install": "./tools.ts --update-text-objects",
     "watch": "yarn run esbuild-base --define:DEV=true --sourcemap --watch",
-    "watch:test": "glob src/test/**/*.ts \"--cmd=esbuild --platform=node --format=cjs --target=node16 --outdir=out/test --sourcemap --watch\"",
+    "watch:test": "globstar -- esbuild \"src/test/**/*.ts\" --platform=node --format=cjs --target=node16 --outdir=out/test --sourcemap --watch",
     "pretest": "yarn run compile && yarn run lint",
-    "lint": "eslint src --ext ts",
-    "test": "node ./out/test/runTest.js"
+    "lint": "eslint src --ext ts; deno fmt --check README.md src/ tools.ts",
+    "test": "node ./out/test/runTest.js",
+    "vscode:prepublish": "yarn run compile"
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",
@@ -58,6 +59,7 @@
     "esbuild": "^0.17.14",
     "eslint": "^8.36.0",
     "glob": "^10.2.1",
+    "globstar": "^1.0.0",
     "mocha": "^10.2.0",
     "tree-sitter-c": "^0.20.2",
     "tree-sitter-cli": "^0.20.8",
